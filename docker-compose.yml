@@ -1,0 +1,11 @@
+services:
+  dayz-signal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dayz-signal
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${HTTP_PORT:-8080}:${HTTP_PORT:-8080}"
