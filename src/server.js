@@ -40,6 +40,7 @@ function safeEqual(a, b) {
 }
 
 const config = {
+  serviceName: String(process.env.SERVICE_NAME || "dayz-signal").trim(),
   httpHost: process.env.HTTP_HOST || "0.0.0.0",
   httpPort: readNumber(process.env.HTTP_PORT, 8080),
   apiKey: String(process.env.API_KEY || "").trim(),
@@ -78,6 +79,7 @@ app.use(express.json({ limit: "256kb" }));
 app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
+    service: config.serviceName,
     rcon: rcon.status(),
   });
 });
@@ -104,6 +106,7 @@ app.post("/broadcast", requireApiKey, async (req, res) => {
     const response = await rcon.sendGlobalMessage(rawMessage);
     return res.json({
       ok: true,
+      service: config.serviceName,
       command: "say -1 <message>",
       response,
     });
@@ -122,7 +125,7 @@ async function start() {
 
   const server = app.listen(config.httpPort, config.httpHost, () => {
     // eslint-disable-next-line no-console
-    console.log(`HTTP server: http://${config.httpHost}:${config.httpPort}`);
+    console.log(`[${config.serviceName}] HTTP server: http://${config.httpHost}:${config.httpPort}`);
   });
 
   const shutdown = () => {

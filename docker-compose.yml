@@ -1,11 +1,48 @@
+x-dayz-signal-base: &dayz_signal_base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+
 services:
-  dayz-signal:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: dayz-signal
-    restart: unless-stopped
-    env_file:
-      - .env
+  dayz-signal-server1:
+    <<: *dayz_signal_base
+    container_name: dayz-signal-server1
+    environment:
+      SERVICE_NAME: ${SERVER1_NAME:-dayz-server-1}
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: 8080
+      API_KEY: ${SERVER1_API_KEY:-change_me_server1}
+      RCON_HOST: ${SERVER1_RCON_HOST}
+      RCON_PORT: ${SERVER1_RCON_PORT:-2305}
+      RCON_PASSWORD: ${SERVER1_RCON_PASSWORD}
+      RCON_CONNECTION_TYPE: ${SERVER1_RCON_CONNECTION_TYPE:-udp4}
+      RCON_CONNECTION_TIMEOUT_MS: ${SERVER1_RCON_CONNECTION_TIMEOUT_MS:-50000}
+      RCON_CONNECTION_INTERVAL_MS: ${SERVER1_RCON_CONNECTION_INTERVAL_MS:-5000}
+      RCON_KEEPALIVE_MS: ${SERVER1_RCON_KEEPALIVE_MS:-10000}
+      RCON_COMMAND_TIMEOUT_MS: ${SERVER1_RCON_COMMAND_TIMEOUT_MS:-7000}
+      RCON_RECONNECT_BASE_MS: ${SERVER1_RCON_RECONNECT_BASE_MS:-1000}
+      RCON_RECONNECT_MAX_MS: ${SERVER1_RCON_RECONNECT_MAX_MS:-30000}
     ports:
-      - "${HTTP_PORT:-8080}:${HTTP_PORT:-8080}"
+      - "${SERVER1_HTTP_PORT:-8081}:8080"
+
+  dayz-signal-server2:
+    <<: *dayz_signal_base
+    container_name: dayz-signal-server2
+    environment:
+      SERVICE_NAME: ${SERVER2_NAME:-dayz-server-2}
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: 8080
+      API_KEY: ${SERVER2_API_KEY:-change_me_server2}
+      RCON_HOST: ${SERVER2_RCON_HOST}
+      RCON_PORT: ${SERVER2_RCON_PORT:-2305}
+      RCON_PASSWORD: ${SERVER2_RCON_PASSWORD}
+      RCON_CONNECTION_TYPE: ${SERVER2_RCON_CONNECTION_TYPE:-udp4}
+      RCON_CONNECTION_TIMEOUT_MS: ${SERVER2_RCON_CONNECTION_TIMEOUT_MS:-50000}
+      RCON_CONNECTION_INTERVAL_MS: ${SERVER2_RCON_CONNECTION_INTERVAL_MS:-5000}
+      RCON_KEEPALIVE_MS: ${SERVER2_RCON_KEEPALIVE_MS:-10000}
+      RCON_COMMAND_TIMEOUT_MS: ${SERVER2_RCON_COMMAND_TIMEOUT_MS:-7000}
+      RCON_RECONNECT_BASE_MS: ${SERVER2_RCON_RECONNECT_BASE_MS:-1000}
+      RCON_RECONNECT_MAX_MS: ${SERVER2_RCON_RECONNECT_MAX_MS:-30000}
+    ports:
+      - "${SERVER2_HTTP_PORT:-8082}:8080"
