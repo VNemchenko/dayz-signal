@@ -1,144 +1,183 @@
-const express = require("express");
-const dotenv = require("dotenv");
+const http = require("node:http");
+const { BroadcastService } = require("./broadcastService");
+const { loadConfig } = require("./config");
+const { createHttpHandler } = require("./httpApp");
+const { JsonlJournal } = require("./journal");
 const { DayzRconClient } = require("./rconClient");
 
-dotenv.config();
-
-function readNumber(value, fallback) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : fallback;
+function log(event, fields = {}) {
+  process.stdout.write(`${JSON.stringify({ timestamp: new Date().toISOString(), event, ...fields })}\n`);
 }
 
-function classifyError(err) {
-  const message = err && err.message ? err.message : String(err);
-  const lower = message.toLowerCase();
-
-  if (lower.includes("message is required")) {
-    return { code: 400, message };
-  }
-  if (lower.includes("timed out")) {
-    return { code: 504, message };
-  }
-  if (
-    lower.includes("not connected") ||
-    lower.includes("connecting") ||
-    lower.includes("disconnected") ||
-    lower.includes("command was not sent")
-  ) {
-    return { code: 503, message };
-  }
-  return { code: 500, message };
-}
-
-function safeEqual(a, b) {
-  const left = Buffer.from(String(a || ""), "utf8");
-  const right = Buffer.from(String(b || ""), "utf8");
-  if (left.length !== right.length) {
-    return false;
-  }
-  return require("crypto").timingSafeEqual(left, right);
-}
-
-const config = {
-  serviceName: String(process.env.SERVICE_NAME || "dayz-signal").trim(),
-  httpHost: process.env.HTTP_HOST || "0.0.0.0",
-  httpPort: readNumber(process.env.HTTP_PORT, 8080),
-  apiKey: String(process.env.API_KEY || "").trim(),
-  rconHost: String(process.env.RCON_HOST || "").trim(),
-  rconPort: readNumber(process.env.RCON_PORT, 0),
-  rconPassword: String(process.env.RCON_PASSWORD || "").trim(),
-  rconConnectionType: process.env.RCON_CONNECTION_TYPE || "udp4",
-  rconConnectionTimeoutMs: readNumber(process.env.RCON_CONNECTION_TIMEOUT_MS, 50000),
-  rconConnectionIntervalMs: readNumber(process.env.RCON_CONNECTION_INTERVAL_MS, 5000),
-  rconKeepAliveMs: readNumber(process.env.RCON_KEEPALIVE_MS, 10000),
-  rconCommandTimeoutMs: readNumber(process.env.RCON_COMMAND_TIMEOUT_MS, 7000),
-  rconReconnectBaseMs: readNumber(process.env.RCON_RECONNECT_BASE_MS, 1000),
-  rconReconnectMaxMs: readNumber(process.env.RCON_RECONNECT_MAX_MS, 30000),
-};
-
-if (!config.rconHost || !config.rconPort || !config.rconPassword) {
-  throw new Error("RCON_HOST, RCON_PORT and RCON_PASSWORD are required");
-}
-
-const rcon = new DayzRconClient({
-  host: config.rconHost,
-  port: config.rconPort,
-  password: config.rconPassword,
-  connectionType: config.rconConnectionType,
-  connectionTimeoutMs: config.rconConnectionTimeoutMs,
-  connectionIntervalMs: config.rconConnectionIntervalMs,
-  keepAliveMs: config.rconKeepAliveMs,
-  commandTimeoutMs: config.rconCommandTimeoutMs,
-  reconnectBaseMs: config.rconReconnectBaseMs,
-  reconnectMaxMs: config.rconReconnectMaxMs,
-});
-
-const app = express();
-app.use(express.json({ limit: "256kb" }));
-
-app.get("/health", (_req, res) => {
-  res.json({
-    status: "ok",
-    service: config.serviceName,
-    rcon: rcon.status(),
+function withTimeout(promise, timeoutMs, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
   });
-});
-
-function requireApiKey(req, res, next) {
-  if (!config.apiKey) {
-    return next();
-  }
-
-  const headerKey = req.header("x-api-key");
-  const auth = String(req.header("authorization") || "");
-  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
-  const provided = headerKey || bearer;
-
-  if (!safeEqual(provided, config.apiKey)) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  return next();
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-app.post("/broadcast", requireApiKey, async (req, res) => {
-  const rawMessage = req.body && typeof req.body.message === "string" ? req.body.message : "";
-  try {
-    const response = await rcon.sendGlobalMessage(rawMessage);
-    return res.json({
-      ok: true,
-      service: config.serviceName,
-      command: "say -1 <message>",
-      response,
-    });
-  } catch (err) {
-    const mapped = classifyError(err);
-    return res.status(mapped.code).json({ ok: false, error: mapped.message });
-  }
-});
+function listen(server, port, host, timeoutMs) {
+  return withTimeout(new Promise((resolve, reject) => {
+    const onError = (error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, host);
+  }), timeoutMs, "HTTP listen");
+}
 
-app.use((_req, res) => {
-  res.status(404).json({ error: "Not found" });
-});
+function closeHttpServer(server, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer;
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    server.close(finish);
+    if (typeof server.closeIdleConnections === "function") {
+      server.closeIdleConnections();
+    }
+    timer = setTimeout(() => {
+      if (typeof server.closeAllConnections === "function") {
+        server.closeAllConnections();
+      }
+      finish();
+    }, Math.max(1, timeoutMs));
+  });
+}
 
 async function start() {
-  await rcon.init();
+  const config = loadConfig();
+  let shuttingDown = false;
+  const rcon = new DayzRconClient(config.rcon);
+  const journal = new JsonlJournal(config.broadcasts.journalPath, {
+    retentionMs: config.broadcasts.retentionMs,
+    maxRecords: config.broadcasts.maxRecords,
+    maxBytes: config.broadcasts.maxBytes,
+  });
+  const broadcasts = new BroadcastService({ rcon, journal, config: config.broadcasts });
 
-  const server = app.listen(config.httpPort, config.httpHost, () => {
-    // eslint-disable-next-line no-console
-    console.log(`[${config.serviceName}] HTTP server: http://${config.httpHost}:${config.httpPort}`);
+  try {
+    await withTimeout(broadcasts.init(), config.startupTimeoutMs, "journal startup");
+    await withTimeout(rcon.init(), config.startupTimeoutMs, "RCON startup");
+  } catch (error) {
+    rcon.close();
+    try {
+      await withTimeout(broadcasts.close(1000), 2000, "startup cleanup");
+    } catch (_cleanupError) {
+      // The original startup error is the actionable failure.
+    }
+    throw error;
+  }
+
+  broadcasts.on("update", (record) => {
+    log("broadcast_state", {
+      service: config.serviceName,
+      request_id: record.requestId,
+      state: record.state,
+      queue_depth: broadcasts.queueDepth(),
+      latency_ms: Date.now() - (record.acceptedAt || record.createdAt),
+      error_code: record.errorCode || undefined,
+    });
+  });
+  let pendingFatal = false;
+  let shutdown = async () => { pendingFatal = true; };
+  broadcasts.on("fatal", (error) => {
+    log("broadcast_fatal", { service: config.serviceName, error_code: "journal_or_queue_failure", detail: error.message });
+    void shutdown("fatal");
+  });
+  rcon.on("state", (status) => {
+    log("rcon_state", {
+      service: config.serviceName,
+      state: status.state,
+      error_code: status.lastErrorCode || undefined,
+      reconnect_attempts: status.reconnectAttempts,
+    });
   });
 
-  const shutdown = () => {
-    server.close(() => process.exit(0));
-    rcon.close();
+  const handler = createHttpHandler({ config, broadcasts, rcon, isShuttingDown: () => shuttingDown });
+  const server = http.createServer(handler);
+  server.requestTimeout = Math.max(5000, config.httpWaitMs + 2000);
+  server.headersTimeout = 5000;
+  server.keepAliveTimeout = 5000;
+  server.on("clientError", (_error, socket) => {
+    if (socket.writable) {
+      socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    }
+  });
+
+  try {
+    await listen(server, config.httpPort, config.httpHost, config.startupTimeoutMs);
+  } catch (error) {
+    await Promise.allSettled([
+      closeHttpServer(server, 1000),
+      withTimeout(broadcasts.close(1000), 2000, "listen failure cleanup"),
+    ]);
+    throw error;
+  }
+  log("http_started", { service: config.serviceName, host: config.httpHost, port: config.httpPort });
+
+  let shutdownPromise;
+  shutdown = (reason) => {
+    if (shutdownPromise) {
+      return shutdownPromise;
+    }
+    shuttingDown = true;
+    shutdownPromise = (async () => {
+      log("shutdown_started", { service: config.serviceName, reason });
+      const results = await Promise.allSettled([
+        closeHttpServer(server, config.shutdownGraceMs),
+        withTimeout(
+          broadcasts.close(config.shutdownGraceMs),
+          Math.max(1000, config.shutdownGraceMs + 1000),
+          "broadcast shutdown",
+        ),
+      ]);
+      const failed = results.filter((result) => result.status === "rejected");
+      if (failed.length > 0) {
+        process.exitCode = 1;
+        log("shutdown_incomplete", {
+          service: config.serviceName,
+          error_code: "shutdown_timeout_or_failure",
+          failure_count: failed.length,
+        });
+      } else {
+        log("shutdown_complete", { service: config.serviceName });
+      }
+    })();
+    return shutdownPromise;
   };
 
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  if (pendingFatal) {
+    void shutdown("fatal_during_startup");
+  }
+
+  process.once("SIGINT", () => void shutdown("SIGINT"));
+  process.once("SIGTERM", () => void shutdown("SIGTERM"));
+  return { server, broadcasts, rcon, shutdown };
 }
 
-start().catch((err) => {
-  // eslint-disable-next-line no-console
-  console.error("Fatal startup error:", err && err.message ? err.message : err);
-  process.exit(1);
-});
+if (require.main === module) {
+  start().catch((error) => {
+    process.stderr.write(`${JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event: "startup_failed",
+      error: error.message,
+    })}\n`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { start, withTimeout, closeHttpServer };

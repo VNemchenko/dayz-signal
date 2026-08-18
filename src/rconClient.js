@@ -1,442 +1,471 @@
+const dgram = require("node:dgram");
+const dns = require("node:dns");
+const EventEmitter = require("node:events");
+const CRC32 = require("crc-32");
+const { RconError } = require("./errors");
+
+function buildPacket(type, body = Buffer.alloc(0)) {
+  const payload = Buffer.concat([Buffer.from([0xff, type]), body]);
+  const header = Buffer.alloc(6);
+  header.write("BE", 0, "ascii");
+  header.writeInt32LE(CRC32.buf(payload) | 0, 2);
+  return Buffer.concat([header, payload]);
+}
+
 function parsePacket(buffer) {
-  if (!buffer || buffer.length < 8) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 8 || buffer.toString("ascii", 0, 2) !== "BE") {
     return null;
   }
-  if (buffer.toString("utf8", 0, 2) !== "BE") {
+  const payload = buffer.subarray(6);
+  if (payload[0] !== 0xff || buffer.readInt32LE(2) !== (CRC32.buf(payload) | 0)) {
     return null;
   }
-  const payload = buffer.subarray(7);
-  if (payload.length < 2) {
-    return null;
+  const type = payload[1];
+  const data = payload.subarray(2);
+  if (type === 0) {
+    return data.length >= 1 ? { type, success: data[0] === 1 } : null;
   }
-  return {
-    code: payload.readUInt8(0),
-    sequence: payload.readUInt8(1),
-    data: payload.subarray(2),
-  };
+  if (type === 1 || type === 2) {
+    return data.length >= 1 ? { type, sequence: data[0], data: data.subarray(1) } : null;
+  }
+  return null;
 }
 
-async function loadRconClass() {
-  const mod = await import("battleye-node");
-  return mod.default || mod;
+function loginPacket(password) {
+  return buildPacket(0, Buffer.from(password, "ascii"));
 }
 
-class DayzRconClient {
-  constructor(config) {
+function commandPacket(sequence, command = "") {
+  return buildPacket(1, Buffer.concat([Buffer.from([sequence]), Buffer.from(command, "ascii")]));
+}
+
+function serverMessageAckPacket(sequence) {
+  return buildPacket(2, Buffer.from([sequence]));
+}
+
+function normalizeAddress(address) {
+  return String(address || "").replace(/^::ffff:/, "").toLowerCase();
+}
+
+class DayzRconClient extends EventEmitter {
+  constructor(config, dependencies = {}) {
+    super();
     this.config = { ...config };
-    this.state = "disconnected";
-    this.lastError = null;
-    this.closed = false;
+    this.dgram = dependencies.dgram || dgram;
+    this.lookup = dependencies.lookup || dns.promises.lookup.bind(dns.promises);
+    this.random = dependencies.random || Math.random;
+    this.now = dependencies.now || Date.now;
+    this.setTimer = dependencies.setTimeout || setTimeout;
+    this.clearTimer = dependencies.clearTimeout || clearTimeout;
+    this.setInterval = dependencies.setInterval || setInterval;
+    this.clearInterval = dependencies.clearInterval || clearInterval;
 
-    this.RCONClass = null;
-    this.client = null;
-
-    this.socketRef = null;
-    this.socketMessageHandler = null;
-    this.socketErrorHandler = null;
-    this.socketCloseHandler = null;
-
+    this.state = "stopped";
+    this.closed = true;
+    this.socket = null;
+    this.targetAddress = null;
+    this.generation = 0;
+    this.sequence = -1;
     this.pending = null;
-    this.commandChain = Promise.resolve();
-
-    this.connectPromise = null;
-    this.connectResolve = null;
-    this.connectReject = null;
-    this.connectTimer = null;
-
+    this.keepaliveSequences = new Set();
+    this.loginRetryTimer = null;
+    this.loginDeadlineTimer = null;
+    this.keepaliveTimer = null;
     this.reconnectTimer = null;
     this.reconnectAttempts = 0;
+    this.lastOutboundAt = 0;
+    this.lastErrorCode = null;
+    this.serverMessages = 0;
+    this.invalidPackets = 0;
   }
 
   async init() {
-    if (this.client) {
-      return;
+    if (
+      typeof this.config.password !== "string" ||
+      this.config.password.length < 12 ||
+      !/^[\x20-\x7e]+$/.test(this.config.password)
+    ) {
+      throw new Error("RCON_PASSWORD must contain at least 12 printable ASCII characters");
     }
-    this.RCONClass = await loadRconClass();
-    this.client = this.createClient();
-    this.setupHandlers();
+    if (!this.closed) {
+      throw new Error("RCON client is already initialized");
+    }
+    const family = this.config.connectionType === "udp6" ? 6 : 4;
+    this.closed = false;
+    const lookupGeneration = ++this.generation;
+    this.setState("resolving");
+    let resolved;
+    try {
+      resolved = await this.lookup(this.config.host, { family });
+    } catch (error) {
+      if (lookupGeneration === this.generation) {
+        this.closed = true;
+        this.lastErrorCode = "dns_lookup_failed";
+        this.setState("stopped");
+      }
+      throw error;
+    }
+    if (this.closed || lookupGeneration !== this.generation) {
+      throw new RconError("client_closed", "RCON client closed during address resolution", { safeToRetry: true });
+    }
+    this.targetAddress = typeof resolved === "string" ? resolved : resolved.address;
     this.connect();
   }
 
-  createClient() {
-    return new this.RCONClass({
-      address: this.config.host,
-      port: this.config.port,
-      password: this.config.password,
-      connectionType: this.config.connectionType || "udp4",
-      connectionTimeout: this.config.connectionTimeoutMs,
-      connectionInterval: this.config.connectionIntervalMs,
-      keepAliveInterval: this.config.keepAliveMs,
-    });
-  }
-
-  setupHandlers() {
-    this.client.on("onConnect", (isConnected) => {
-      if (isConnected) {
-        this.state = "connected";
-        this.lastError = null;
-        this.reconnectAttempts = 0;
-        this.clearReconnectTimer();
-        this.resolveConnect();
-      } else {
-        this.state = "error";
-        this.lastError = "Disconnected";
-        this.failPending("Disconnected");
-        this.rejectConnect(new Error("Disconnected"));
-        this.scheduleReconnect("Disconnected");
-      }
-      this.attachSocket();
-    });
-
-    this.client.on("error", (msg) => {
-      const text = typeof msg === "string" ? msg : String(msg);
-      this.state = "error";
-      this.lastError = text;
-      if (!this.isTransientError(text)) {
-        this.failPending(text);
-        this.rejectConnect(new Error(text));
-      }
-      if (this.shouldScheduleReconnect(text)) {
-        this.scheduleReconnect(text);
-      }
-    });
-  }
-
-  isTransientError(message) {
-    const lower = String(message || "").toLowerCase();
-    return lower.includes("trying to connect") || lower.includes("already connected");
-  }
-
-  shouldScheduleReconnect(message) {
-    const lower = String(message || "").toLowerCase();
-    if (!lower) {
-      return true;
-    }
-    if (lower.includes("trying to connect")) {
-      return false;
-    }
-    if (lower.includes("already connected")) {
-      return false;
-    }
-    return true;
-  }
-
   connect() {
-    if (!this.client || this.closed) {
+    if (this.closed || this.state === "connecting" || this.state === "connected") {
       return;
     }
-    this.attachSocket();
-    if (this.client.isRconConnected) {
-      return;
-    }
-    if (this.client.loginConnectionInterval) {
-      return;
-    }
-    this.state = "connecting";
-    this.client.login();
+    this.clearReconnectTimer();
+    this.cleanupSocket();
+    const generation = ++this.generation;
+    this.socket = this.dgram.createSocket(this.config.connectionType || "udp4");
+    this.socket.on("message", (message, rinfo) => this.handleMessage(generation, message, rinfo));
+    this.socket.on("error", () => this.beginBackoff("socket_error", generation));
+    this.socket.on("close", () => this.beginBackoff("socket_closed", generation));
+    this.setState("connecting");
+    this.sendLogin(generation);
+    this.loginRetryTimer = this.setInterval(() => this.sendLogin(generation), this.config.connectionIntervalMs);
+    this.loginDeadlineTimer = this.setTimer(() => this.beginBackoff("login_timeout", generation), this.config.connectionTimeoutMs);
+    this.unref(this.loginRetryTimer);
+    this.unref(this.loginDeadlineTimer);
   }
 
-  attachSocket() {
-    const socket = this.client && this.client.udp ? this.client.udp.socket : null;
-    if (!socket || socket === this.socketRef) {
+  sendLogin(generation) {
+    if (this.closed || generation !== this.generation || this.state !== "connecting") {
+      return;
+    }
+    this.sendDatagram(loginPacket(this.config.password), generation).catch(() => {
+      this.beginBackoff("login_send_failed", generation);
+    });
+  }
+
+  sendDatagram(packet, generation = this.generation) {
+    return new Promise((resolve, reject) => {
+      if (!this.socket || this.closed || generation !== this.generation) {
+        reject(new Error("RCON socket is unavailable"));
+        return;
+      }
+      this.socket.send(packet, this.config.port, this.targetAddress, (error) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+
+  handleMessage(generation, message, rinfo) {
+    if (generation !== this.generation || this.closed || !this.isExpectedSource(rinfo)) {
+      this.invalidPackets += 1;
+      return;
+    }
+    const packet = parsePacket(message);
+    if (!packet) {
+      this.invalidPackets += 1;
       return;
     }
 
-    this.detachSocket();
-    this.socketRef = socket;
-
-    if (!this.socketMessageHandler) {
-      this.socketMessageHandler = (msg) => this.handleRawMessage(msg);
-    }
-    if (!this.socketErrorHandler) {
-      this.socketErrorHandler = (err) => this.handleSocketError(err);
-    }
-    if (!this.socketCloseHandler) {
-      this.socketCloseHandler = () => this.handleSocketClose();
-    }
-
-    socket.on("message", this.socketMessageHandler);
-    socket.on("error", this.socketErrorHandler);
-    socket.on("close", this.socketCloseHandler);
-  }
-
-  detachSocket() {
-    if (!this.socketRef) {
+    if (packet.type === 0) {
+      if (this.state !== "connecting") {
+        return;
+      }
+      if (packet.success) {
+        this.onConnected();
+      } else {
+        this.beginBackoff("authentication_failed", generation);
+      }
       return;
     }
-    if (this.socketMessageHandler) {
-      this.socketRef.off("message", this.socketMessageHandler);
-    }
-    if (this.socketErrorHandler) {
-      this.socketRef.off("error", this.socketErrorHandler);
-    }
-    if (this.socketCloseHandler) {
-      this.socketRef.off("close", this.socketCloseHandler);
-    }
-    this.socketRef = null;
-  }
-
-  handleSocketError(err) {
-    const message = err && err.message ? err.message : String(err);
-    this.state = "error";
-    this.lastError = message;
-    this.failPending(message);
-    this.rejectConnect(new Error(message));
-    this.scheduleReconnect(message);
-  }
-
-  handleSocketClose() {
-    this.state = "error";
-    this.lastError = "UDP socket closed";
-    this.failPending("UDP socket closed");
-    this.rejectConnect(new Error("UDP socket closed"));
-    this.scheduleReconnect("UDP socket closed");
-  }
-
-  scheduleReconnect() {
-    if (this.closed || this.reconnectTimer) {
+    if (this.state !== "connected") {
       return;
     }
-    const delay = this.computeReconnectDelay();
-    this.reconnectTimer = setTimeout(() => {
+    if (packet.type === 1) {
+      this.handleCommandResponse(packet);
+      return;
+    }
+    if (packet.type === 2) {
+      this.serverMessages += 1;
+      this.sendDatagram(serverMessageAckPacket(packet.sequence), generation).catch(() => {
+        this.beginBackoff("server_message_ack_failed", generation);
+      });
+      this.emit("serverMessage", { sequence: packet.sequence, length: packet.data.length });
+    }
+  }
+
+  isExpectedSource(rinfo) {
+    return Boolean(
+      rinfo &&
+      Number(rinfo.port) === Number(this.config.port) &&
+      normalizeAddress(rinfo.address) === normalizeAddress(this.targetAddress)
+    );
+  }
+
+  onConnected() {
+    this.clearLoginTimers();
+    this.reconnectAttempts = 0;
+    this.lastErrorCode = null;
+    this.keepaliveSequences.clear();
+    this.lastOutboundAt = this.now();
+    this.setState("connected");
+    this.keepaliveTimer = this.setInterval(() => this.sendKeepalive(), this.config.keepAliveMs);
+    this.unref(this.keepaliveTimer);
+  }
+
+  sendKeepalive() {
+    if (this.closed || this.state !== "connected" || this.pending) {
+      return;
+    }
+    if (this.now() - this.lastOutboundAt < this.config.keepAliveMs) {
+      return;
+    }
+    if (this.keepaliveSequences.size >= 2) {
+      this.beginBackoff("keepalive_timeout", this.generation);
+      return;
+    }
+    const generation = this.generation;
+    const sequence = this.nextSequence();
+    this.keepaliveSequences.add(sequence);
+    this.lastOutboundAt = this.now();
+    this.sendDatagram(commandPacket(sequence), generation).catch(() => {
+      if (generation !== this.generation || this.closed) {
+        return;
+      }
+      this.keepaliveSequences.delete(sequence);
+      this.beginBackoff("keepalive_send_failed", generation);
+    });
+  }
+
+  handleCommandResponse(packet) {
+    if (this.keepaliveSequences.delete(packet.sequence)) {
+      return;
+    }
+    const pending = this.pending;
+    if (!pending || pending.sequence !== packet.sequence) {
+      return;
+    }
+    if (packet.data.length >= 3 && packet.data[0] === 0x00) {
+      const expected = packet.data[1];
+      const index = packet.data[2];
+      if (expected === 0 || index >= expected || (pending.expectedParts && pending.expectedParts !== expected)) {
+        return;
+      }
+      pending.expectedParts = expected;
+      pending.parts.set(index, Buffer.from(packet.data.subarray(3)));
+      if (pending.parts.size < expected) {
+        return;
+      }
+      const parts = [];
+      for (let part = 0; part < expected; part += 1) {
+        if (!pending.parts.has(part)) {
+          return;
+        }
+        parts.push(pending.parts.get(part));
+      }
+      this.finishPending(Buffer.concat(parts).toString("ascii"));
+      return;
+    }
+    this.finishPending(packet.data.toString("ascii"));
+  }
+
+  nextSequence() {
+    for (let attempts = 0; attempts < 256; attempts += 1) {
+      this.sequence = this.sequence >= 255 ? 0 : this.sequence + 1;
+      if ((!this.pending || this.pending.sequence !== this.sequence) && !this.keepaliveSequences.has(this.sequence)) {
+        return this.sequence;
+      }
+    }
+    throw new RconError("sequence_exhausted", "No free RCON sequence number", { safeToRetry: true });
+  }
+
+  sendGlobalMessage(message) {
+    return this.sendCommand(`say -1 ${message}`);
+  }
+
+  sendCommand(command) {
+    if (this.closed || this.state !== "connected" || !this.socket) {
+      return Promise.reject(new RconError("not_connected", "RCON is not connected", { safeToRetry: true }));
+    }
+    if (this.pending) {
+      return Promise.reject(new RconError("command_busy", "Another RCON command is in flight", { safeToRetry: true }));
+    }
+    if (!/^[\x20-\x7e]+$/.test(command)) {
+      return Promise.reject(new RconError("invalid_command", "RCON command must contain printable ASCII only"));
+    }
+
+    const sequence = this.nextSequence();
+    const generation = this.generation;
+    return new Promise((resolve, reject) => {
+      const pending = {
+        sequence,
+        generation,
+        written: false,
+        timer: null,
+        expectedParts: 0,
+        parts: new Map(),
+        resolve,
+        reject,
+      };
+      this.pending = pending;
+      this.sendDatagram(commandPacket(sequence, command), generation).then(() => {
+        if (this.pending !== pending) {
+          return;
+        }
+        pending.written = true;
+        this.lastOutboundAt = this.now();
+        pending.timer = this.setTimer(() => {
+          if (this.pending !== pending) {
+            return;
+          }
+          this.pending = null;
+          reject(new RconError("command_timeout", "RCON command response timed out", { deliveryUnknown: true }));
+          this.beginBackoff("command_timeout", generation);
+        }, this.config.commandTimeoutMs);
+        this.unref(pending.timer);
+      }).catch(() => {
+        if (this.pending === pending) {
+          this.pending = null;
+          reject(new RconError("command_send_failed", "RCON command was not written to UDP", { safeToRetry: true }));
+        }
+        this.beginBackoff("command_send_failed", generation);
+      });
+    });
+  }
+
+  finishPending(response) {
+    const pending = this.pending;
+    if (!pending) {
+      return;
+    }
+    this.pending = null;
+    if (pending.timer) {
+      this.clearTimer(pending.timer);
+    }
+    pending.resolve(response);
+  }
+
+  rejectPending(code) {
+    const pending = this.pending;
+    if (!pending) {
+      return;
+    }
+    this.pending = null;
+    if (pending.timer) {
+      this.clearTimer(pending.timer);
+    }
+    pending.reject(new RconError(code, "RCON connection was lost", {
+      safeToRetry: !pending.written,
+      deliveryUnknown: pending.written,
+    }));
+  }
+
+  beginBackoff(code, generation) {
+    if (this.closed || generation !== this.generation || this.state === "backoff") {
+      return;
+    }
+    this.lastErrorCode = code;
+    this.rejectPending(code);
+    this.clearLoginTimers();
+    this.clearKeepaliveTimer();
+    this.cleanupSocket();
+    this.setState("backoff");
+    const cap = Math.min(
+      this.config.reconnectMaxMs,
+      this.config.reconnectBaseMs * (2 ** Math.min(this.reconnectAttempts, 10)),
+    );
+    this.reconnectAttempts += 1;
+    const delay = Math.max(1, Math.floor(this.random() * cap));
+    this.reconnectTimer = this.setTimer(() => {
       this.reconnectTimer = null;
-      this.recreateClient();
       this.connect();
     }, delay);
+    this.unref(this.reconnectTimer);
   }
 
-  computeReconnectDelay() {
-    const base = Math.max(Number(this.config.reconnectBaseMs || 1000), 200);
-    const max = Math.max(Number(this.config.reconnectMaxMs || 30000), base);
-    this.reconnectAttempts = Math.min(this.reconnectAttempts + 1, 10);
-    return Math.min(max, base * Math.pow(2, this.reconnectAttempts - 1));
-  }
-
-  clearReconnectTimer() {
-    if (!this.reconnectTimer) {
-      return;
-    }
-    clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = null;
-  }
-
-  recreateClient() {
-    this.clearConnectWait();
-    this.detachSocket();
-    if (this.client) {
-      this.client.removeAllListeners();
-      try {
-        this.client.logout();
-      } catch (_err) {
-        // noop
-      }
-    }
-    this.client = this.createClient();
-    this.setupHandlers();
-    this.attachSocket();
+  setState(state) {
+    this.state = state;
+    this.emit("state", this.status());
   }
 
   status() {
     return {
       state: this.state,
-      connected: Boolean(this.client && this.client.isRconConnected),
-      lastError: this.lastError,
+      connected: this.state === "connected",
+      lastErrorCode: this.lastErrorCode,
+      reconnectAttempts: this.reconnectAttempts,
+      serverMessages: this.serverMessages,
+      invalidPackets: this.invalidPackets,
     };
   }
 
-  async sendGlobalMessage(message) {
-    const text = String(message || "").replace(/[\r\n]+/g, " ").trim();
-    if (!text) {
-      throw new Error("message is required");
+  clearLoginTimers() {
+    if (this.loginRetryTimer) {
+      this.clearInterval(this.loginRetryTimer);
+      this.loginRetryTimer = null;
     }
-    return this.sendCommand("say", ["-1", text]);
-  }
-
-  async sendCommand(command, args = []) {
-    const task = this.commandChain.then(() => this.sendCommandInternal(command, args));
-    this.commandChain = task.catch(() => {});
-    return task;
-  }
-
-  async sendCommandInternal(command, args = []) {
-    await this.ensureConnected();
-    const fullCommand = [command, ...args].join(" ").trim();
-    if (!fullCommand) {
-      throw new Error("RCON command is empty");
+    if (this.loginDeadlineTimer) {
+      this.clearTimer(this.loginDeadlineTimer);
+      this.loginDeadlineTimer = null;
     }
-    const sequence = this.sendRawCommand(fullCommand);
-    return this.awaitResponse(sequence);
   }
 
-  sendRawCommand(command) {
-    const before = Number(this.client ? this.client.sequence : -1);
-    this.client.commandSend(command);
-    const after = Number(this.client ? this.client.sequence : -1);
-
-    if (after === before) {
-      if (!this.client || !this.client.isRconConnected) {
-        throw new Error("RCON is not connected");
-      }
-      if (this.client.loginConnectionInterval) {
-        throw new Error("RCON is connecting");
-      }
-      throw new Error("RCON command was not sent");
+  clearKeepaliveTimer() {
+    if (this.keepaliveTimer) {
+      this.clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
     }
-    return after;
+    this.keepaliveSequences.clear();
   }
 
-  awaitResponse(sequence) {
-    const timeoutMs = Math.max(Number(this.config.commandTimeoutMs || 7000), 1000);
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (this.pending && this.pending.sequence === sequence) {
-          this.pending = null;
-        }
-        this.scheduleReconnect("Command timed out");
-        reject(new Error("RCON command timed out"));
-      }, timeoutMs);
-
-      this.pending = {
-        sequence,
-        expectedParts: null,
-        parts: new Map(),
-        timer,
-        resolve,
-        reject,
-      };
-    });
+  clearReconnectTimer() {
+    if (this.reconnectTimer) {
+      this.clearTimer(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
   }
 
-  handleRawMessage(msg) {
-    const parsed = parsePacket(msg);
-    if (!parsed) {
+  cleanupSocket() {
+    if (!this.socket) {
       return;
     }
-    if (parsed.code === 1) {
-      this.handleCommandResponse(parsed.sequence, parsed.data);
+    const socket = this.socket;
+    this.socket = null;
+    socket.removeAllListeners();
+    try {
+      socket.close();
+    } catch (_error) {
+      // A UDP socket that never bound cannot be closed.
     }
   }
 
-  handleCommandResponse(sequence, data) {
-    const pending = this.pending;
-    if (!pending || pending.sequence !== sequence) {
-      return;
+  unref(timer) {
+    if (timer && typeof timer.unref === "function") {
+      timer.unref();
     }
-
-    if (!data || data.length === 0) {
-      this.finalizePending("");
-      return;
-    }
-
-    if (data.length >= 3 && data[0] === 0x00) {
-      const expected = data[1];
-      const index = data[2];
-      const text = data.subarray(3).toString("utf8");
-
-      if (expected) {
-        pending.expectedParts = expected;
-      }
-      pending.parts.set(index, text);
-
-      if (pending.expectedParts && pending.parts.size >= pending.expectedParts) {
-        const ordered = [];
-        for (let i = 0; i < pending.expectedParts; i += 1) {
-          ordered.push(pending.parts.get(i) || "");
-        }
-        this.finalizePending(ordered.join(""));
-      }
-      return;
-    }
-
-    this.finalizePending(data.toString("utf8"));
-  }
-
-  finalizePending(text) {
-    if (!this.pending) {
-      return;
-    }
-    const pending = this.pending;
-    this.pending = null;
-    clearTimeout(pending.timer);
-    pending.resolve(text);
-  }
-
-  failPending(reason) {
-    if (!this.pending) {
-      return;
-    }
-    const pending = this.pending;
-    this.pending = null;
-    clearTimeout(pending.timer);
-    pending.reject(new Error(reason || "RCON request canceled"));
-  }
-
-  ensureConnected() {
-    if (this.closed) {
-      return Promise.reject(new Error("Client is closed"));
-    }
-    if (this.client && this.client.isRconConnected) {
-      return Promise.resolve();
-    }
-    if (this.connectPromise) {
-      return this.connectPromise;
-    }
-
-    this.connectPromise = new Promise((resolve, reject) => {
-      this.connectResolve = resolve;
-      this.connectReject = reject;
-      const timeoutMs = Math.max(Number(this.config.connectionTimeoutMs || 50000), 50000) + 1000;
-      this.connectTimer = setTimeout(() => {
-        this.rejectConnect(new Error("RCON connection timed out"));
-      }, timeoutMs);
-    });
-
-    this.connect();
-    return this.connectPromise;
-  }
-
-  resolveConnect() {
-    if (this.connectResolve) {
-      this.connectResolve();
-    }
-    this.clearConnectWait();
-  }
-
-  rejectConnect(error) {
-    if (this.connectReject) {
-      this.connectReject(error);
-    }
-    this.clearConnectWait();
-  }
-
-  clearConnectWait() {
-    if (this.connectTimer) {
-      clearTimeout(this.connectTimer);
-    }
-    this.connectTimer = null;
-    this.connectPromise = null;
-    this.connectResolve = null;
-    this.connectReject = null;
   }
 
   close() {
-    this.closed = true;
-    this.clearReconnectTimer();
-    this.failPending("Stopped");
-    this.rejectConnect(new Error("Stopped"));
-    this.detachSocket();
-
-    if (this.client) {
-      this.client.removeAllListeners();
-      try {
-        this.client.logout();
-      } catch (_err) {
-        // noop
-      }
+    if (this.closed && this.state === "stopped") {
+      return;
     }
-    this.client = null;
-    this.state = "disconnected";
+    this.closed = true;
+    this.generation += 1;
+    this.clearLoginTimers();
+    this.clearKeepaliveTimer();
+    this.clearReconnectTimer();
+    this.rejectPending("client_closed");
+    this.cleanupSocket();
+    this.lastErrorCode = null;
+    this.setState("stopped");
   }
 }
 
-module.exports = { DayzRconClient };
+module.exports = {
+  DayzRconClient,
+  buildPacket,
+  parsePacket,
+  loginPacket,
+  commandPacket,
+  serverMessageAckPacket,
+};
